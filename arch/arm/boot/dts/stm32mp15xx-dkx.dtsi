@@ -732,3 +732,14 @@
 	vdda-supply = <&vdd>;
 	status = "okay";
 };
+
+&mlahb {
+	i2c_rpmsg: i2c@1 {
+		compatible = "rpmsg,i2c-controller";
+		reg = <1 0>;
+		rpmsg,dev-id = "rpmsg_i2c";
+		#address-cells = <1>;
+		#size-cells = <0>;
+		status = "okay";
+	};
+};
