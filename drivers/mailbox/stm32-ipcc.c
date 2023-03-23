@@ -9,7 +9,6 @@
 #include <linux/clk.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
-#include <linux/irqdomain.h>
 #include <linux/mailbox_controller.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
@@ -41,6 +40,10 @@
 
 #define STM32_MAX_PROCS		2
 
+/* Use virtual ID by setting bit 8 of a channel ID to keep interrupt context for client */
+#define STM32_IPCC_CH_ID_MASK		GENMASK(7, 0)
+#define STM32_IPCC_CH_HIGH_PRIO_MASK	GENMASK(8, 8)
+
 enum {
 	IPCC_IRQ_RX,
 	IPCC_IRQ_TX,
@@ -51,7 +54,6 @@ struct stm32_ipcc_ch {
 	struct mbox_chan *mbox;
 	struct work_struct rx_work;
 	unsigned long      chan;
-	u32 		   irq_mask;		/* 1: activated 0: disabled */
 	bool               irq_ctx;
 };
 
@@ -61,7 +63,6 @@ struct stm32_ipcc {
 	void __iomem *reg_proc;
 	struct clk *clk;
 	struct stm32_ipcc_ch *chnl;
-	struct irq_domain *irqd;
 	struct workqueue_struct *workqueue;
 	spinlock_t lock; /* protect access to IPCC registers */
 	int irqs[IPCC_IRQ_NUM];
@@ -132,7 +133,7 @@ static irqreturn_t stm32_ipcc_rx_irq(int irq, void *data)
 		 */
 
 		if (chnl->irq_ctx)
-			handle_nested_irq(irq_find_mapping(ipcc->irqd, chnl->chan));
+			mbox_chan_received_data(chnl->mbox, NULL);
 		else
 			queue_work(ipcc->workqueue, &chnl->rx_work);
 
@@ -175,55 +176,6 @@ static irqreturn_t stm32_ipcc_tx_irq(int irq, void *data)
 
 	return ret;
 }
-
-static void stm32_ipcc_mask_irq(struct irq_data *d)
-{
-	struct stm32_ipcc_ch *chn = irq_data_get_irq_chip_data(d);
-
-	chn->irq_mask = 0;
-}
-
-static void stm32_ipcc_unmask_irq(struct irq_data *d)
-{
-	struct stm32_ipcc_ch *chn = irq_data_get_irq_chip_data(d);
-
-	chn->irq_mask = 1;
-}
-
-
-static struct irq_chip stm32_ipcc_chip = {
-	.name		= "irq-rpmsg",
-	.irq_mask	= stm32_ipcc_mask_irq,
-	.irq_unmask	= stm32_ipcc_unmask_irq,
-};
-
-static int stm32_ipcc_map(struct irq_domain *d,
-			 unsigned int virq, irq_hw_number_t hw)
-{
-	struct stm32_ipcc *ipcc = d->host_data;
-	struct mbox_controller *mbox =  &ipcc->controller;
-	struct stm32_ipcc_ch *chnl;
-
-	if (hw >= ipcc->n_chans)
-		return -EINVAL;
-
-	chnl = &ipcc->chnl[hw];
-
-	if (!chnl->mbox) {
-		dev_err(mbox->dev, "chan:%lu not created\n", __func__, chnl->chan);
-		return -EINVAL;
-	}
-	
-	chnl->irq_ctx = true;
-
-	irq_set_status_flags(virq, IRQ_LEVEL);
-	irq_set_chip_and_handler(virq, &stm32_ipcc_chip, handle_level_irq);
-	irq_set_chip_data(virq, chnl);
-	irq_set_nested_thread(virq, 1);
-
-	return 0;
-}
-
 
 static int stm32_ipcc_send_data(struct mbox_chan *link, void *data)
 {
@@ -292,7 +244,7 @@ static const struct mbox_chan_ops stm32_ipcc_ops = {
 static struct mbox_chan *stm32_ipcc_xlate(struct mbox_controller *mbox,
 					  const struct of_phandle_args *sp)
 {
-	int ind = sp->args[0];
+	int ind = sp->args[0] & STM32_IPCC_CH_ID_MASK;
 	struct stm32_ipcc_ch *chnl;
 
 	if (ind >= mbox->num_chans)
@@ -301,17 +253,13 @@ static struct mbox_chan *stm32_ipcc_xlate(struct mbox_controller *mbox,
 	chnl = (struct stm32_ipcc_ch *)mbox->chans[ind].con_priv;
 	chnl->mbox = &mbox->chans[ind];
 	chnl->chan = ind;
+	chnl->irq_ctx = !!(sp->args[0] & STM32_IPCC_CH_HIGH_PRIO_MASK);
 
 	if (!chnl->irq_ctx)
 		INIT_WORK(&chnl->rx_work, stm32_ipcc_rx_work);
 
 	return &mbox->chans[ind];
 }
-
-static const struct irq_domain_ops stm32_ipcc_domain_ops = {
-	.map = stm32_ipcc_map,
-	.xlate = irq_domain_xlate_onecell,
-};
 
 static int stm32_ipcc_probe(struct platform_device *pdev)
 {
@@ -425,22 +373,15 @@ static int stm32_ipcc_probe(struct platform_device *pdev)
 	for (i = 0; i < ipcc->controller.num_chans; i++)
 		ipcc->controller.chans[i].con_priv = (void *)&ipcc->chnl[i];
 
-	ipcc->irqd = irq_domain_create_linear(dev->fwnode, ipcc->n_chans,  &stm32_ipcc_domain_ops,
-					      ipcc);
-	if (!ipcc->irqd) {
-		dev_err(dev, "Failed to create IRQ domain\n");
-		goto err_irq_wkp;
-	}	
-
 	ret = devm_mbox_controller_register(dev, &ipcc->controller);
 	if (ret)
-		goto err_irq_domain;
+		goto err_irq_wkp;
 
 	ipcc->workqueue = create_workqueue(dev_name(dev));
 	if (!ipcc->workqueue) {
 		dev_err(dev, "cannot create workqueue\n");
 		ret = -ENOMEM;
-		goto err_irq_domain;
+		goto err_irq_wkp;
 	}
 
 	platform_set_drvdata(pdev, ipcc);
@@ -455,8 +396,6 @@ static int stm32_ipcc_probe(struct platform_device *pdev)
 	clk_disable_unprepare(ipcc->clk);
 	return 0;
 
-err_irq_domain:
-	irq_domain_remove(ipcc->irqd);
 err_irq_wkp:
 	if (of_property_read_bool(np, "wakeup-source"))
 		dev_pm_clear_wake_irq(dev);
