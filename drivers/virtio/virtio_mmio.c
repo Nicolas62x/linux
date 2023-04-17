@@ -69,8 +69,9 @@
 #include <linux/virtio_config.h>
 #include <uapi/linux/virtio_mmio.h>
 #include <linux/virtio_ring.h>
-
-
+#include <linux/of_reserved_mem.h>
+#include <linux/dma-map-ops.h>
+#include <linux/dma-direct.h>
 
 /* The alignment to use between consumer and producer parts of vring.
  * Currently hardcoded to the page size. */
@@ -595,7 +596,37 @@ static void virtio_mmio_release_dev(struct device *_d)
 	devm_kfree(&pdev->dev, vm_dev);
 }
 
-/* Platform device */
+static int virtio_mmio_of_parse_mem(struct virtio_mmio_device *rvdev)
+{
+	struct device *dev = &rvdev->pdev->dev;
+	struct device_node *np = dev->of_node;
+	struct of_phandle_iterator it;
+	struct reserved_mem *rmem;
+	int ret = 0;
+
+	/* Register associated reserved memory regions */
+	of_phandle_iterator_init(&it, np, "memory-region", NULL, 0);
+
+	while (of_phandle_iterator_next(&it) == 0) {
+
+
+		if (!strcmp(it.node->name, "virtio0mem")) {
+
+			rmem = of_reserved_mem_lookup(it.node);
+
+			if (!rmem) {
+				dev_err(dev, "unable to acquire memory-region %s\n", it.node->name);
+				return -EINVAL;
+			}
+
+			ret = dma_declare_coherent_memory(dev, rmem->base, rmem->base, rmem->size);
+
+			if (ret)
+				dev_err(dev, "Failed dma declare coherent :(");
+		}
+	}
+	return ret;
+}
 
 static int virtio_mmio_probe(struct platform_device *pdev)
 {
@@ -642,6 +673,11 @@ static int virtio_mmio_probe(struct platform_device *pdev)
 		return -ENODEV;
 	}
 	vm_dev->vdev.id.vendor = readl(vm_dev->base + VIRTIO_MMIO_VENDOR_ID);
+
+	rc = virtio_mmio_of_parse_mem(vm_dev);
+
+	if (rc)
+		return rc;
 
 	if (vm_dev->version == 1) {
 		writel(PAGE_SIZE, vm_dev->base + VIRTIO_MMIO_GUEST_PAGE_SIZE);
