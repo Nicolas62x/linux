@@ -38,6 +38,7 @@
 #include <linux/virtio_ring.h>
 #include <asm/byteorder.h>
 #include <linux/platform_device.h>
+#include <linux/of_platform.h>
 
 #include "remoteproc_internal.h"
 
@@ -1263,6 +1264,31 @@ void rproc_resource_cleanup(struct rproc *rproc)
 }
 EXPORT_SYMBOL(rproc_resource_cleanup);
 
+static const struct of_device_id rproc_child_match_table[] = {
+	{ .compatible = "virtio,mmio", },
+	{ }
+};
+
+static int rproc_platform_populate(struct rproc *rproc)
+{
+	struct device *dev = rproc->dev.parent;
+	int ret;
+
+	ret = of_platform_populate(dev->of_node, rproc_child_match_table, NULL, dev);
+	if (ret < 0) {
+		dev_err(dev, "failed to populate child devices (%d)\n", ret);
+
+		goto depopulate;
+	}
+
+	return 0;
+
+depopulate:
+	of_platform_depopulate(dev);
+
+	return ret;
+}
+
 static int rproc_start(struct rproc *rproc, const struct firmware *fw)
 {
 	struct resource_table *loaded_table;
@@ -1303,6 +1329,11 @@ static int rproc_start(struct rproc *rproc, const struct firmware *fw)
 		dev_err(dev, "can't start rproc %s: %d\n", rproc->name, ret);
 		goto unprepare_subdevices;
 	}
+
+	/* probe remoteproc device resource suppliers */
+	ret = rproc_platform_populate(rproc);
+	if (ret)
+		return ret;
 
 	/* Start any subdevices for the remote processor */
 	ret = rproc_start_subdevices(rproc);
@@ -2574,6 +2605,8 @@ int rproc_del(struct rproc *rproc)
 
 	/* Ensure that no readers of rproc_list are still active */
 	synchronize_rcu();
+
+	of_platform_depopulate(rproc->dev.parent);
 
 	device_del(&rproc->dev);
 	rproc_char_device_remove(rproc);
