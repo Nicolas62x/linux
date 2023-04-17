@@ -132,10 +132,12 @@ static irqreturn_t stm32_ipcc_rx_irq(int irq, void *data)
 		 */
 
 		if (chnl->irq_ctx) {
-			dev_dbg(dev, "%s: IRQ chan:%d rx\n", __func__, chan);
-			mbox_chan_received_data(chnl->mbox, NULL);
-			if(!chnl->irq_mask)
-				handle_nested_irq(irq_find_mapping(ipcc->irqd, chnl->chan));
+			if (!chnl->irq_mask) {
+				local_irq_disable();
+				handle_simple_irq(
+					irq_to_desc(irq_find_mapping(ipcc->irqd, chnl->chan)));
+				local_irq_enable();
+			}
 		} else {
 			dev_dbg(dev, "%s: WK chan:%d rx\n", __func__, chan);
 			queue_work(ipcc->workqueue, &chnl->rx_work);
@@ -185,14 +187,14 @@ static void stm32_ipcc_mask_irq(struct irq_data *d)
 {
 	struct stm32_ipcc_ch *chn = irq_data_get_irq_chip_data(d);
 
-	chn->irq_mask = 0;
+	chn->irq_mask = 1;
 }
 
 static void stm32_ipcc_unmask_irq(struct irq_data *d)
 {
 	struct stm32_ipcc_ch *chn = irq_data_get_irq_chip_data(d);
 
-	chn->irq_mask = 1;
+	chn->irq_mask = 0;
 }
 
 
@@ -216,16 +218,24 @@ static int stm32_ipcc_map(struct irq_domain *d,
 
 	chnl = &ipcc->chnl[hw];
 
-	if (!chnl->mbox) {
-		dev_err(mbox->dev, "chan:%lu not created\n", chnl->chan);
+	if (chnl->mbox) {
+		dev_err(mbox->dev, "chan:%lu already used\n", chnl->chan);
 		return -EINVAL;
 	}
+
+	chnl->mbox = &mbox->chans[hw];
+	chnl->chan = hw;
 	
 	chnl->irq_ctx = true;
 
 	irq_set_status_flags(virq, IRQ_LEVEL);
 	irq_set_chip_and_handler(virq, &stm32_ipcc_chip, handle_level_irq);
 	irq_set_chip_data(virq, chnl);
+
+	/* unmask 'rx channel occupied' interrupt */
+	stm32_ipcc_clr_bits(&ipcc->lock, ipcc->reg_proc + IPCC_XMR,
+			    RX_BIT_CHAN(hw));
+
 	return 0;
 }
 
