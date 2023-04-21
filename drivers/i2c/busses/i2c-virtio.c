@@ -68,7 +68,7 @@ static void virtio_sg_init(struct scatterlist *sg, void *cpu_addr, unsigned int 
 	}
 }
 
-static void set_dma_buffer(struct device *dma_dev, struct virtio_i2c_req *req, struct i2c_msg *msg)
+static void get_dma_buffer(struct device *dma_dev, struct virtio_i2c_req *req, struct i2c_msg *msg)
 {
 	req->buf = dma_alloc_coherent(dma_dev, msg->len, &req->dma_handle, GFP_KERNEL);
 
@@ -78,6 +78,9 @@ static void set_dma_buffer(struct device *dma_dev, struct virtio_i2c_req *req, s
 
 static void put_dma_buffer(struct device *dma_dev, struct virtio_i2c_req *req, struct i2c_msg *msg)
 {
+	if (msg->flags & I2C_M_RD)
+		memcpy(msg->buf, req->buf, msg->len);
+
 	dma_free_coherent(dma_dev, msg->len, req->buf, req->dma_handle);
 }
 
@@ -113,7 +116,7 @@ static int virtio_i2c_prepare_reqs(struct virtqueue *vq,
 		sgs[outcnt++] = &out_hdr;
 
 		if (msgs[i].len) {
-			set_dma_buffer(vq->vdev->dev.parent, &reqs[i], &msgs[i]);
+			get_dma_buffer(vq->vdev->dev.parent, &reqs[i], &msgs[i]);
 
 			if (!reqs[i].buf) {
 				kfree(reqs[i].completion);
@@ -155,8 +158,7 @@ static int virtio_i2c_complete_reqs(struct virtqueue *vq,
 
 		wait_for_completion(req->completion);
 
-		if (!failed && req->in_hdr.status != VIRTIO_I2C_MSG_OK)
-			failed = true;
+		failed |= req->in_hdr.status != VIRTIO_I2C_MSG_OK;
 
 		put_dma_buffer(vq->vdev->dev.parent, req, &msgs[i]);
 
